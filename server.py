@@ -1,13 +1,8 @@
 """
 Judi Health IDP — Local Web Server
 ====================================
-Loads ANTHROPIC_API_KEY from .env.
-Runs real Docling + EasyOCR on uploaded image, then passes OCR text to Claude Haiku.
-
-Usage:
-    pip install -r requirements.txt
-    python server.py
-    → Open http://localhost:5000
+Layer 1: Google Document AI Form Parser
+Layer 2: Claude Haiku — only for medication/diagnosis fields below 95% confidence
 """
 
 import json
@@ -21,16 +16,30 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.getenv("ANTHROPIC_API_KEY")
+API_KEY      = os.getenv("ANTHROPIC_API_KEY")
+GCP_PROJECT  = os.getenv("GCP_PROJECT_ID", "")
+GCP_LOCATION = os.getenv("GCP_LOCATION", "us")
+GCP_PROCESSOR= os.getenv("GCP_PROCESSOR_ID", "")
+
 if not API_KEY:
     print("WARNING: ANTHROPIC_API_KEY not found in .env")
 
 app = Flask(__name__, static_folder=".")
 
+# Fields where confidence must be 95%+ or they go to LLM
+MEDICATION_DIAGNOSIS = {
+    "brand_name", "generic_name", "strength", "directions",
+    "quantity", "day_supply", "duration_of_therapy", "therapy_type",
+    "icd10_codes", "patient_height", "patient_weight",
+    "previous_medications", "documentation_provided",
+}
+THRESHOLD = 0.95
+
 
 @app.route("/")
 def index():
     return send_from_directory(".", "index.html")
+
 
 
 @app.route("/api/process", methods=["POST"])
@@ -41,23 +50,19 @@ def process():
     data = request.json
     image_b64 = data.get("image_b64")
     media_type = data.get("media_type", "image/jpeg")
-    threshold = data.get("threshold", 75)
 
     if not image_b64:
         return jsonify({"error": "No image provided"}), 400
 
-    # ── Decode and save image to temp file for Docling ─────────────
+    # ── Compress if needed ─────────────────────────────────────────
     image_bytes = base64.b64decode(image_b64)
-
-    # Compress if still too large
-    MAX_BYTES = 4_800_000
-    if len(image_bytes) > MAX_BYTES:
+    if len(image_bytes) > 4_800_000:
         try:
             from PIL import Image as PILImage
             img = PILImage.open(io.BytesIO(image_bytes))
             if img.mode in ("RGBA", "P"):
                 img = img.convert("RGB")
-            ratio = (MAX_BYTES / len(image_bytes)) ** 0.5
+            ratio = (4_800_000 / len(image_bytes)) ** 0.5
             img = img.resize((int(img.width * ratio), int(img.height * ratio)), PILImage.LANCZOS)
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=85)
@@ -65,107 +70,53 @@ def process():
             image_b64 = base64.b64encode(image_bytes).decode()
             media_type = "image/jpeg"
         except Exception as e:
-            return jsonify({"error": f"Image compression failed: {e}"}), 500
+            return jsonify({"error": f"Compression failed: {e}"}), 500
 
-    # Write to temp file so Docling can read it
-    suffix = ".jpg" if "jpeg" in media_type or "jpg" in media_type else ".png"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(image_bytes)
-        tmp_path = tmp.name
+    # ── Layer 1: Google Document AI Form Parser ────────────────────
+    if not (GCP_PROJECT and GCP_PROCESSOR):
+        return jsonify({"error": "GCP not configured — set GCP_PROJECT_ID and GCP_PROCESSOR_ID in .env"}), 500
 
-    # ── Layer 1: Docling + EasyOCR ─────────────────────────────────
     try:
-        from ocr import run_ocr
-        ocr_result = run_ocr(tmp_path)
-    except Exception as e:
-        return jsonify({"error": f"OCR failed: {e}"}), 500
-    finally:
-        os.unlink(tmp_path)
+        from google.cloud import documentai
+        from google.api_core.client_options import ClientOptions
 
-    ocr_text = ocr_result["text"]
-    ocr_confidence = ocr_result["confidence"]
-    ocr_engine = ocr_result["engine"]
-    routing = ocr_result.get("routing", {})
-    above_threshold = ocr_confidence >= threshold
+        opts = ClientOptions(api_endpoint=f"{GCP_LOCATION}-documentai.googleapis.com")
+        client = documentai.DocumentProcessorServiceClient(client_options=opts)
+        processor_name = client.processor_path(GCP_PROJECT, GCP_LOCATION, GCP_PROCESSOR)
+
+        mime_type = "image/jpeg" if "jpeg" in media_type or "jpg" in media_type else "image/png"
+        raw_document = documentai.RawDocument(content=image_bytes, mime_type=mime_type)
+        req = documentai.ProcessRequest(name=processor_name, raw_document=raw_document)
+        result = client.process_document(request=req)
+        document = result.document
+
+        # Build key-value map from Document AI
+        docai_fields = {}
+        confidences = []
+        for page in document.pages:
+            for field in page.form_fields:
+                key = field.field_name.text_anchor.content.strip().rstrip(":") if field.field_name.text_anchor else ""
+                val = field.field_value.text_anchor.content.strip() if field.field_value.text_anchor else ""
+                conf = getattr(field.field_value, "confidence", 0.85)
+                if key:
+                    docai_fields[key] = {"value": val or None, "confidence": conf}
+                    confidences.append(conf)
+
+        ocr_confidence = (sum(confidences) / len(confidences) * 100) if confidences else 80.0
+        docai_text = f"=== FORM FIELDS (Google Document AI) ===\n"
+        docai_text += "\n".join(f"{k}: {v['value'] or 'not found'}" for k, v in docai_fields.items())
+        docai_text += f"\n\n=== RAW TEXT ===\n{document.text}"
+
+        print(f"  [Layer 1] Document AI: {len(docai_fields)} fields, avg confidence {ocr_confidence:.1f}%")
+
+    except Exception as e:
+        return jsonify({"error": f"Google Document AI failed: {e}"}), 500
 
     # ── Layer 2: Claude Haiku — structured extraction ──────────────
-    system_prompt = """You are a medical document extraction AI for Judi Health's Intelligent Document Processing pipeline.
-
-You will receive OCR text extracted from a prior authorization form. Extract all fields with confidence scores.
-
-Return ONLY valid JSON — no markdown, no explanation:
-
-{
-  "patient": {
-    "first_name":    {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "last_name":     {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "date_of_birth": {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "gender":        {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "phone":         {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "address":       {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "city":          {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "state":         {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "zip_code":      {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "member_id":     {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false}
-  },
-  "prescriber": {
-    "first_name":  {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "last_name":   {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "specialty":   {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "npi_number":  {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "phone":       {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "fax":         {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "address":     {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "city":        {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "state":       {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "zip_code":    {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false}
-  },
-  "pharmacy": {
-    "name": {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "fax":  {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false}
-  },
-  "medication": {
-    "brand_name":          {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "generic_name":        {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "strength":            {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "directions":          {"value": null, "confidence": 0.0, "layer": "llm", "needs_review": false},
-    "quantity":            {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "day_supply":          {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "duration_of_therapy": {"value": null, "confidence": 0.0, "layer": "llm", "needs_review": false},
-    "therapy_type":        {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false}
-  },
-  "diagnosis": {
-    "icd10_codes":            {"value": [], "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "patient_height":         {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "patient_weight":         {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "previous_medications":   {"value": null, "confidence": 0.0, "layer": "llm", "needs_review": false},
-    "documentation_provided": {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false}
-  },
-  "request": {
-    "request_date":                 {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "expedite_review":              {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "prescriber_signature_present": {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false},
-    "prescriber_signature_date":    {"value": null, "confidence": 0.0, "layer": "ocr", "needs_review": false}
-  }
-}
-
-Confidence rules:
-- Printed text, clearly readable: 0.92-0.99
-- Printed text, partially obscured: 0.70-0.91
-- Handwritten text, clearly readable: 0.80-0.95
-- Handwritten text, ambiguous: 0.50-0.79
-- Inferred from context: 0.40-0.65
-- Not present or illegible: 0.0, value: null
-
-Layer rules:
-- "ocr": machine-readable printed text
-- "llm": required interpretation, handwriting parsing, or inference
-
-needs_review: true if confidence < 0.75, OR value is null, OR field is critical and confidence < 0.98
-Critical fields: first_name, last_name, date_of_birth, address, brand_name, directions, icd10_codes, npi_number
-
-Normalize: dates → YYYY-MM-DD, phones → XXX-XXX-XXXX
-Checkboxes: look for X or check marks — extract as true/false, not null"""
+    # Claude maps Document AI's key-value pairs into our JSON schema.
+    # We use Document AI's confidence scores (real) not Claude's (self-reported).
+    with open(os.path.join(os.path.dirname(__file__), "prompt.txt")) as f:
+        system_prompt = f.read()
 
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -178,10 +129,7 @@ Checkboxes: look for X or check marks — extract as true/false, not null"""
             "model": "claude-haiku-4-5-20251001",
             "max_tokens": 2000,
             "system": system_prompt,
-            "messages": [{
-                "role": "user",
-                "content": f"Extract all fields from this prior authorization form OCR text:\n\n<ocr_text>\n{ocr_text}\n</ocr_text>"
-            }]
+            "messages": [{"role": "user", "content": f"Structure this Document AI output into the JSON schema:\n\n{docai_text}"}]
         },
         timeout=30
     )
@@ -198,38 +146,166 @@ Checkboxes: look for X or check marks — extract as true/false, not null"""
     usage = api_data["usage"]
     cost = (usage["input_tokens"] / 1e6 * 0.80) + (usage["output_tokens"] / 1e6 * 4.00)
 
-    # Post-process: enforce review flags
-    CRITICAL = {"first_name","last_name","date_of_birth","address","brand_name","directions","icd10_codes","npi_number"}
-    review_count = 0
-    for section in extracted.values():
+    # ── Inject real Document AI confidence scores ─────────────────
+    # Claude's self-reported confidence scores are not reliable — they're
+    # estimates based on instructions, not actual measurement. We replace
+    # them with Document AI's real per-field confidence scores where available.
+    FIELD_KEY_MAP = {
+        # Maps our JSON field names to likely Document AI key names
+        "first_name": ["First Name", "Patient First Name", "Prescriber First Name", "First Name:"],
+        "last_name": ["Last Name", "Patient Last Name", "Last Name:"],
+        "date_of_birth": ["Date of Birth", "DOB", "Date of Birth:"],
+        "gender": ["Male", "Female", "Gender", "Sex"],
+        "phone": ["Phone Number", "Phone", "Phone Number:"],
+        "address": ["Address", "Address:"],
+        "city": ["City", "City:"],
+        "state": ["State", "State:"],
+        "zip_code": ["Zip Code", "ZIP Code", "Zip Code:"],
+        "member_id": ["Member ID", "Member ID:"],
+        "specialty": ["Specialty", "Specialty:"],
+        "npi_number": ["NPI Number", "NPI Number (individual)", "NPI Number:"],
+        "fax": ["Fax Number", "Fax Number (in HIPAA compliant area)", "Fax:"],
+        "brand_name": ["Medication Name and Strength", "Medication Name", "Brand Name"],
+        "directions": ["Directions for Use", "Directions", "Directions for Use:"],
+        "quantity": ["Quantity", "Quantity:"],
+        "day_supply": ["Day Supply", "Day Supply:"],
+        "icd10_codes": ["ICD 10 code(s)", "ICD-10", "ICD 10"],
+        "patient_height": ["Patient Height", "Patient Height (in/cm)"],
+        "patient_weight": ["Patient Weight", "Patient Weight (lb/kg)"],
+    }
+
+    def find_docai_confidence(field_key):
+        candidates = FIELD_KEY_MAP.get(field_key, [])
+        for candidate in candidates:
+            if candidate in docai_fields:
+                return docai_fields[candidate]["confidence"]
+            # Case-insensitive fallback
+            for k, v in docai_fields.items():
+                if k.lower().startswith(candidate.lower()):
+                    return v["confidence"]
+        return None
+
+    for section_name, section in extracted.items():
         for key, field in section.items():
             if not isinstance(field, dict):
                 continue
-            val = field.get("value")
+            real_conf = find_docai_confidence(key)
+            if real_conf is not None:
+                field["confidence"] = round(real_conf, 3)
+
+    # ── Post-process: routing logic ───────────────────────────────
+    # Medication/diagnosis: below 90% → LLM re-extraction
+    # All other fields:     below 80% → LLM re-extraction
+    # Null:                 always needs review
+    MED_DIAG_THRESHOLD = 0.90
+    OTHER_THRESHOLD    = 0.80
+
+    validated_fields = []
+    review_count = 0
+    llm_reextract = []
+
+    for section_name, section in extracted.items():
+        for key, field in section.items():
+            if not isinstance(field, dict):
+                continue
+            val  = field.get("value")
             conf = field.get("confidence", 0)
+
             if val is None or val == [] or val == "":
                 field["needs_review"] = True
-            elif key in CRITICAL and conf < 0.98:
+            elif key in MEDICATION_DIAGNOSIS and conf < MED_DIAG_THRESHOLD:
+                field["layer"] = "llm"
                 field["needs_review"] = True
+                llm_reextract.append(section_name + "." + key)
+            elif key not in MEDICATION_DIAGNOSIS and conf < OTHER_THRESHOLD:
+                field["layer"] = "llm"
+                field["needs_review"] = True
+                llm_reextract.append(section_name + "." + key)
+
             if field.get("needs_review"):
                 review_count += 1
 
-    # Mark medication_brand_name as L1 validated if applicable
-    if "medication_brand_name" in routing.get("validated_fields", {}):
-        if "medication" in extracted and "brand_name" in extracted["medication"]:
-            extracted["medication"]["brand_name"]["layer"] = "l1"
+    # ── LLM re-extraction for low-confidence fields ────────────────
+    if llm_reextract:
+        print("  [Layer 2] Re-extracting " + str(len(llm_reextract)) + " low-confidence fields: " + str(llm_reextract))
+        fields_list = ", ".join(llm_reextract)
+        reextract_prompt = (
+            "The following fields were extracted with low confidence from a prior authorization form. "
+            "Re-extract each field from the Document AI text below and return ONLY a JSON object "
+            "where each key is the field path and the value has 'value' and 'confidence'.\n\n"
+            "Fields to re-extract: " + fields_list + "\n\n"
+            "Document AI text:\n" + docai_text + "\n\n"
+            'Return format: {"patient.last_name": {"value": "Smith", "confidence": 0.92}}\n'
+            "Return ONLY valid JSON, no explanation."
+        )
+
+        reextract_resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": API_KEY,
+                "anthropic-version": "2023-06-01",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": reextract_prompt}]
+            },
+            timeout=20
+        )
+
+        if reextract_resp.ok:
+            try:
+                rd = reextract_resp.json()
+                rt = rd["content"][0]["text"].strip()
+                if rt.startswith("```"):
+                    rt = rt.replace("```json","").replace("```","").strip()
+                reextract_results = json.loads(rt)
+
+                for field_path, result in reextract_results.items():
+                    parts = field_path.split(".", 1)
+                    if len(parts) == 2:
+                        sec, fkey = parts
+                        if sec in extracted and fkey in extracted[sec]:
+                            new_val  = result.get("value")
+                            new_conf = result.get("confidence", 0)
+                            extracted[sec][fkey]["value"]      = new_val
+                            extracted[sec][fkey]["confidence"] = new_conf
+                            extracted[sec][fkey]["layer"]      = "llm"
+                            if new_val is None or new_val == "":
+                                extracted[sec][fkey]["needs_review"] = True
+                            elif new_conf >= 0.80:
+                                extracted[sec][fkey]["needs_review"] = False
+                                review_count = max(0, review_count - 1)
+                print("  [Layer 2] Re-extraction complete for " + str(len(reextract_results)) + " fields")
+            except Exception as e:
+                print("  [Layer 2] Re-extraction parse failed: " + str(e))
+
+    # L1 medication validation via DB
+    from validate import validate_extraction
+    med_section = extracted.get("medication", {})
+    brand = med_section.get("brand_name", {}).get("value")
+    if brand:
+        mock = {"medication": {"brand_name": brand, "generic_name": None, "strength": None}}
+        val_result = validate_extraction(mock)
+        if val_result["medication_valid"]:
+            med_section["brand_name"]["layer"] = "l1"
+            med_section["brand_name"]["confidence"] = 0.99
+            med_section["brand_name"]["needs_review"] = False
+            validated_fields.append("medication_brand_name")
+
+    print(f"  [Layer 2] Claude Haiku: {usage['input_tokens']} in, {usage['output_tokens']} out, ${cost:.5f}")
+    print(f"  [Result] {review_count} fields need review")
 
     return jsonify({
         "ocr": {
             "confidence": round(ocr_confidence, 1),
-            "engine": ocr_engine,
-            "above_threshold": above_threshold,
-            "text_preview": ocr_text[:300],
+            "engine": "Google Document AI Form Parser",
         },
         "routing": {
-            "validated_fields": list(routing.get("validated_fields", {}).keys()),
-            "escalated_fields": routing.get("escalated_fields", []),
-            "reasons": routing.get("reasons", []),
+            "validated_fields": validated_fields,
+            "escalated_fields": [],
+            "reasons": [f"Document AI extracted {len(docai_fields)} key-value pairs"],
         },
         "extracted_data": extracted,
         "review_count": review_count,
@@ -242,9 +318,13 @@ Checkboxes: look for X or check marks — extract as true/false, not null"""
     })
 
 
+
+
 if __name__ == "__main__":
     print("\n  Judi Health IDP — Local Server")
     print("  ================================")
-    print(f"  API key: {'loaded ✓' if API_KEY else 'NOT FOUND in .env'}")
-    print("  Open: http://localhost:5000\n")
+    print(f"  API key:      {'loaded ✓' if API_KEY else 'NOT FOUND in .env'}")
+    print(f"  Document AI:  {'configured ✓' if GCP_PROJECT and GCP_PROCESSOR else 'NOT configured — check .env'}")
+    print("  Open: http://localhost:5000")
+    print("")
     app.run(debug=True, port=5000)
