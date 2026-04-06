@@ -1,0 +1,18 @@
+# Environment variables — never commit these
+.env
+
+# Virtual environment
+.idp/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.log

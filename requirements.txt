@@ -1,0 +1,19 @@
+# Judi Health IDP — Requirements
+# pip install -r requirements.txt
+
+# Layer 1: OCR (primary)
+google-cloud-documentai>=2.20.0  # Google Document AI Form Parser
+
+# Layer 1: OCR (fallback — limited handwriting support)
+docling>=2.0.0                   # Document layout parser
+easyocr>=1.7.0                   # OCR engine (struggles with handwriting)
+pytesseract>=0.3.10              # Last resort fallback
+Pillow>=10.0.0                   # Image processing
+
+# Layer 2: LLM
+anthropic>=0.40.0                # Claude API client
+requests>=2.31.0                 # HTTP for server-side API calls
+
+# Web server
+flask>=3.0.0                     # Local web server
+python-dotenv>=1.0.0             # Load env vars from .env
