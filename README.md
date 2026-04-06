@@ -64,7 +64,7 @@ The core insight: **self-reported confidence scores reflect how certain a model 
 
 ### 1. Clone and create virtual environment
 ```bash
-git clone https://github.com/your-username/judi_health_idp.git
+git clone https://github.com/ritaaoki/judi_health_idp.git
 cd judi_health_idp
 python -m venv .idp
 .idp\Scripts\activate   # Windows
