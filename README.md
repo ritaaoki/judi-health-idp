@@ -38,13 +38,15 @@ A third proprietary layer exists in Judi Health's actual product. This prototype
 
 ## What I learned
 
-**EasyOCR failed badly.** I started with Docling + EasyOCR — open-source, no API cost. It missed most fields on a phone photo of a handwritten form. Returned "1030 N" instead of "2030 N Adams Street", got the date of birth wrong, with a reported confidence of 94%.
-
-The core insight: **self-reported confidence scores reflect how certain a model is about what it saw — not whether what it saw is correct.** EasyOCR was very confident it read "3030". It was wrong.
-
-**Google Document AI worked.** The same photo that broke EasyOCR was correctly parsed by Document AI's Form Parser — address, date of birth, prescriber details, medication all extracted correctly.
-
-**Confidence calibration is the real problem.** EasyOCR reported 95% confidence on a wrong address. Document AI reported 60% confidence on a gender checkbox and got it right. You cannot set a universal confidence threshold across models or field types. The right approach is an empirical calibration study: run labeled forms through the pipeline, plot confidence vs actual accuracy per field type, and derive thresholds from data rather than intuition.
+**EasyOCR failed badly.** Started with Docling + EasyOCR — open-source, no API cost. On a phone photo of a handwritten form it returned "1030 N" instead of "2030 N Adams Street" and got the date of birth wrong. EasyOCR is trained on printed text and struggles with handwriting at low DPI.
+ 
+**Google Document AI worked.** The same photo that broke EasyOCR was correctly parsed — address, date of birth, prescriber details, and medication all extracted correctly.
+ 
+**Confidence score ≠ accuracy.** You cannot set a universal confidence threshold across models or field types. I believe that the right approach is an empirical calibration study: run labeled forms through the pipeline, plot confidence vs actual accuracy per field type, and derive thresholds from data.
+ 
+**Some fields consistently underperform.** Checkboxes and radio buttons (like gender) returned lower confidence across all runs. Handwriting degradation also mattered: member ID fields started confusing "13" and "B" as handwriting got sloppier across multiple form fills.
+ 
+**Field labels vary across payers.** Tested across five forms: RxBenefits, CareSource, Aetna, Cigna, and UnitedHealthcare. Gender exists as a checkbox on some forms and is absent on others. The prototype incorrectly flagged it as missing on forms that simply didn't have the field. 
 
 ---
 
@@ -115,8 +117,7 @@ judi_health_idp/
 ├── validate.py             # Medication database cross-reference
 ├── index.html              # Frontend
 ├── requirements.txt
-├── .env.example            # Environment variable template
-└── INTERVIEW_PREP_OCR.md   # OCR evaluation notes and training strategy
+└──  dummy_data/            # Test forms across 5 payers
 ```
 
 ---
@@ -124,20 +125,11 @@ judi_health_idp/
 ## Known limitations
 
 - **Image quality** — OCR accuracy degrades below 300 DPI. Production would need image preprocessing or higher-quality input.
-- **Handwriting variation** — tested on neat handwriting only. Real prescribers write under time pressure; accuracy would drop without fine-tuning on real prescriber data.
+- **Handwriting variation** — tested on relatively neat handwriting. Real prescribers write under time pressure; accuracy drops without fine-tuning on real prescriber data.
 - **Confidence thresholds not empirically validated** — set based on reasoning, not a calibration study against labeled ground truth.
-- **Not HIPAA compliant** — production deployment would require encrypted storage, a BAA with Google, audit logging, and strict access controls. This prototype runs locally only.
-- **Single form type assumed** — built for one specific pre-auth form. Mixed document types would require a classification layer first.
+- **Payer form variation** — built for the RxBenefits pre-auth form. 
+- **Local only** — production deployment would require encrypted storage, a BAA with Google Document AI, audit logging, and strict access controls.
 
----
-
-## If I had more time
-
-- Run a confidence calibration study on 500+ labeled forms
-- Fine-tune Document AI on real prescriber handwriting (redacted forms)
-- Build a human review queue where every correction becomes a training example
-- Evaluate AWS Textract and Azure Document Intelligence head-to-head
-- Add image preprocessing for low-quality inputs
 
 ---
 
